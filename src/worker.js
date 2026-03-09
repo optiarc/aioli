@@ -21,6 +21,7 @@ const aioli = {
 	base: {},    // Base module (e.g. aioli.tools[0]; not always [0], see init())
 	fs: {},      // Base module's filesystem (e.g. aioli.tools[0].module.FS)
 	opfsRoot: null, // Browser OPFS root handle; used for persistent storage utilities
+	directOpfs: null, // Experimental direct OPFS mount state for the legacy Emscripten FS runtime
 
 	// =========================================================================
 	// Initialize the WebAssembly module(s)
@@ -170,6 +171,7 @@ const aioli = {
 			args = command.trim().split(/ +/); // trim and split by one or more whitespaces to avoid common errors due to extra spaces.
 			toolName = args.shift();
 		}
+		args = args.map(arg => aioli._resolveFsPath(arg));
 
 		// Does it match a program we've already initialized?
 		const tool = aioli.tools.find(t => {
@@ -191,6 +193,9 @@ const aioli = {
 			tool.loading = LOADING_EAGER;
 			await this._initModules();
 		}
+
+		if(aioli.config.opfsBackend === "direct")
+			await aioli._prepareDirectOpfsArgs(args);
 
 		if(options.sync != null)
 			await aioli._syncPathsFromOpfs(options.sync);
@@ -252,10 +257,11 @@ const aioli = {
 	},
 
 	pwd() {
-		return aioli.fs.cwd();
+		return aioli._publicFsPath(aioli.fs.cwd());
 	},
 
 	cd(path) {
+		path = aioli._resolveFsPath(path);
 		for(let tool of aioli.tools) {
 			// Ignore modules that haven't been initialized yet (i.e. lazy-loaded modules)
 			const module = tool.module;
@@ -265,12 +271,18 @@ const aioli = {
 		}
 	},
 
-	mkdir(path) {
+	async mkdir(path) {
+		if(aioli.config.opfsBackend === "direct" && typeof path === "string" && (path === aioli.config.dirOpfs || path.startsWith(`${aioli.config.dirOpfs}/`))) {
+			await aioli._directEnsureDir(path);
+			return true;
+		}
+		path = aioli._resolveFsPath(path);
 		aioli.fs.mkdir(path);
 		return true;
 	},
 
 	read({ path, length, flag="r", offset=0, position=0 }) {
+		path = aioli._resolveFsPath(path);
 		const stream = aioli.fs.open(path, flag);
 		const buffer = new Uint8Array(length);
 		aioli.fs.read(stream, buffer, offset, length, position);
@@ -279,6 +291,7 @@ const aioli = {
 	},
 
 	write({ path, buffer, flag="w+", offset=0, position=0 }) {
+		path = aioli._resolveFsPath(path);
 		const stream = aioli.fs.open(path, flag);
 		aioli.fs.write(stream, buffer, offset, buffer.length, position);
 		aioli.fs.close(stream);
@@ -312,6 +325,74 @@ const aioli = {
 		self.close();
 	},
 
+	opfsSupport(toolName = null) {
+		if(aioli._supportsLegacyDirectOpfs()) {
+			return {
+				backend: aioli.config.opfsBackend,
+				available: true,
+				reason: null,
+				source: "aioli-legacyfs"
+			};
+		}
+
+		const tool = toolName == null
+			? aioli.base
+			: aioli.tools.find(t => t.tool === toolName || t.program === toolName);
+		if(!tool?.module) {
+			return {
+				backend: aioli.config.opfsBackend,
+				available: false,
+				reason: "Tool module is not initialized.",
+				source: "uninitialized"
+			};
+		}
+
+		const mountOpfs = tool.module.mountOpfs;
+		const capabilities = tool.module.biowasmCapabilities || {};
+
+		if(typeof capabilities.mountOpfs === "boolean") {
+			return {
+				backend: aioli.config.opfsBackend,
+				available: capabilities.mountOpfs,
+				reason: capabilities.mountOpfs ? null : "Module capability metadata reports no direct mountOpfs() support.",
+				source: capabilities.mountOpfsSource || "metadata"
+			};
+		}
+
+		if(typeof mountOpfs !== "function") {
+			return {
+				backend: aioli.config.opfsBackend,
+				available: false,
+				reason: "Module does not expose mountOpfs().",
+				source: "missing"
+			};
+		}
+
+		if(mountOpfs.__biowasmStub === true) {
+			return {
+				backend: aioli.config.opfsBackend,
+				available: false,
+				reason: "Module exposes only the generated mountOpfs() stub.",
+				source: "stub"
+			};
+		}
+
+		return {
+			backend: aioli.config.opfsBackend,
+			available: true,
+			reason: null,
+			source: "function"
+		};
+	},
+
+	_requireDirectOpfsSupport(module, toolName = null) {
+		const support = aioli.opfsSupport(toolName);
+		if(support.available)
+			return true;
+		const detail = support.reason ? ` ${support.reason}` : "";
+		throw new Error(`The 'direct' OPFS backend requires module/runtime OPFS mount support.${detail}`);
+	},
+
 	// =========================================================================
 	// OPFS utilities
 	// =========================================================================
@@ -321,6 +402,25 @@ const aioli = {
 	},
 
 	async opfsWrite(path, data = "") {
+		if(aioli.config.opfsBackend === "direct" && aioli._supportsLegacyDirectOpfs()) {
+			const fsPath = aioli._resolveFsPath(`${aioli.config.dirOpfs}${path}`);
+			await aioli._directPrepareFile(fsPath, { create: true, truncate: true });
+			const entry = aioli._directEntryForFsPath(fsPath);
+			const buffer = data instanceof Uint8Array
+				? data
+				: data instanceof ArrayBuffer
+					? new Uint8Array(data)
+					: new TextEncoder().encode(String(data));
+			entry.accessHandle.truncate(0);
+			if(buffer.byteLength > 0)
+				entry.accessHandle.write(buffer, { at: 0 });
+			entry.accessHandle.flush();
+			entry.size = buffer.byteLength;
+			entry.timestamp = Date.now();
+			if(entry.node)
+				entry.node.timestamp = entry.timestamp;
+			return true;
+		}
 		const handle = await aioli._opfsLookup(path, { create: true });
 		const writable = await handle.createWritable();
 		try {
@@ -333,6 +433,22 @@ const aioli = {
 
 	async opfsRead(path, options = {}) {
 		const format = options.encoding || options.format || "text";
+		if(aioli.config.opfsBackend === "direct" && aioli._supportsLegacyDirectOpfs()) {
+			const fsPath = aioli._resolveFsPath(`${aioli.config.dirOpfs}${path}`);
+			const info = aioli.fs?.analyzePath?.(fsPath);
+			if(info?.exists && info.object?.opfsEntry?.accessHandle) {
+				const entry = info.object.opfsEntry;
+				const length = entry.size ?? entry.accessHandle.getSize();
+				const bytes = new Uint8Array(length);
+				if(length > 0)
+					entry.accessHandle.read(bytes, { at: 0 });
+				if(format === "arrayBuffer")
+					return bytes.buffer.slice(0);
+				if(format === "blob")
+					return new Blob([bytes]);
+				return new TextDecoder().decode(bytes);
+			}
+		}
 		const handle = await aioli._opfsLookup(path);
 		const file = await handle.getFile();
 		if(format === "arrayBuffer")
@@ -356,6 +472,8 @@ const aioli = {
 	},
 
 	async opfsDelete(path, options = {}) {
+		if(aioli.config.opfsBackend === "direct" && aioli._supportsLegacyDirectOpfs())
+			aioli._directForgetPath(aioli._resolveFsPath(`${aioli.config.dirOpfs}${path}`), { recursive: options.recursive === true });
 		const parts = aioli._splitOpfsPath(path);
 		if(parts.length === 0)
 			throw "Cannot delete the OPFS root.";
@@ -367,18 +485,22 @@ const aioli = {
 	},
 
 	async opfsStage(opfsPath, fsPath = null) {
-		const targetPath = fsPath || `${aioli.config.dirOpfs}${opfsPath}`;
-		await aioli.copyFromOpfs(opfsPath, targetPath);
-		return targetPath;
+		const targetPath = aioli._resolveFsPath(fsPath || `${aioli.config.dirOpfs}${opfsPath}`);
+		await aioli._opfsBackendStageFromOpfs(opfsPath, targetPath);
+		return aioli._publicFsPath(targetPath);
 	},
 
 	async opfsFlush(fsPath, opfsPath = null) {
+		fsPath = aioli._resolveFsPath(fsPath);
 		const targetPath = opfsPath || aioli._defaultOpfsPath(fsPath);
-		await aioli.copyToOpfs(fsPath, targetPath);
+		await aioli._opfsBackendFlushToOpfs(fsPath, targetPath);
 		return targetPath;
 	},
 
 	async copyToOpfs(fsPath, opfsPath = null) {
+		fsPath = aioli._resolveFsPath(fsPath);
+		if(aioli.config.opfsBackend === "direct" && fsPath.startsWith(`${aioli.config.dirOpfs}/`))
+			return opfsPath || aioli._defaultOpfsPath(fsPath);
 		if(!opfsPath)
 			opfsPath = `/${fsPath.split("/").pop()}`;
 		const data = aioli.fs.readFile(fsPath);
@@ -388,7 +510,12 @@ const aioli = {
 
 	async copyFromOpfs(opfsPath, fsPath = null) {
 		if(!fsPath)
-			fsPath = opfsPath;
+			fsPath = `${aioli.config.dirOpfs}${opfsPath}`;
+		fsPath = aioli._resolveFsPath(fsPath);
+		if(aioli.config.opfsBackend === "direct" && fsPath.startsWith(`${aioli.config.dirOpfs}/`)) {
+			await aioli._directPrepareFile(fsPath, { create: false, truncate: false });
+			return fsPath;
+		}
 		const data = new Uint8Array(await aioli.opfsRead(opfsPath, { format: "arrayBuffer" }));
 		const dir = fsPath.split("/").slice(0, -1).join("/");
 		if(dir)
@@ -520,7 +647,7 @@ const aioli = {
 			FS.mkdir(aioli.config.dirShared, 0o777);
 			FS.mkdir(`${aioli.config.dirShared}/${aioli.config.dirData}`, 0o777);
 			FS.mkdir(`${aioli.config.dirShared}/${aioli.config.dirMounted}`, 0o777);
-			FS.mkdirTree(aioli.config.dirOpfs);
+			await aioli._opfsBackendInitFS(FS, tool.module);
 			FS.chdir(`${aioli.config.dirShared}/${aioli.config.dirData}`);
 			aioli.fs = FS;
 
@@ -630,9 +757,11 @@ const aioli = {
 	},
 
 	_defaultOpfsPath(fsPath) {
+		if(fsPath.startsWith(`${aioli._opfsBackendRoot()}/`))
+			return fsPath.slice(aioli._opfsBackendRoot().length);
 		if(fsPath.startsWith(`${aioli.config.dirOpfs}/`))
 			return fsPath.slice(aioli.config.dirOpfs.length);
-		if(fsPath === aioli.config.dirOpfs)
+		if(fsPath === aioli._opfsBackendRoot() || fsPath === aioli.config.dirOpfs)
 			return "/";
 		return `/${fsPath.split("/").filter(Boolean).pop()}`;
 	},
@@ -646,7 +775,7 @@ const aioli = {
 				item = { path: item };
 
 			const opfsPath = item.opfs || item.path;
-			const fsPath = item.fs || `${aioli.config.dirOpfs}${opfsPath}`;
+			const fsPath = aioli._resolveFsPath(item.fs || `${aioli.config.dirOpfs}${opfsPath}`);
 			try {
 				await aioli.opfsStage(opfsPath, fsPath);
 			} catch(error) {
@@ -666,7 +795,7 @@ const aioli = {
 				item = { path: item };
 
 			const opfsPath = item.opfs || item.path;
-			const fsPath = item.fs || `${aioli.config.dirOpfs}${opfsPath}`;
+			const fsPath = aioli._resolveFsPath(item.fs || `${aioli.config.dirOpfs}${opfsPath}`);
 			const info = aioli.fs.analyzePath(fsPath);
 			if(!info.exists)
 				continue;
@@ -676,6 +805,7 @@ const aioli = {
 
 	// Common file operations
 	_fileop(operation, path) {
+		path = aioli._resolveFsPath(path);
 		aioli._log(`Running ${operation} ${path}`);
 
 		// Check whether the file exists
@@ -705,6 +835,463 @@ const aioli = {
 		}
 
 		return false;
+	},
+
+	_resolveFsPath(path) {
+		if(typeof path !== "string")
+			return path;
+		if(path === aioli.config.dirOpfs)
+			return aioli._opfsBackendRoot();
+		if(path.startsWith(`${aioli.config.dirOpfs}/`))
+			return `${aioli._opfsBackendRoot()}${path.slice(aioli.config.dirOpfs.length)}`;
+		return path;
+	},
+
+	_publicFsPath(path) {
+		if(typeof path !== "string")
+			return path;
+		if(path === aioli._opfsBackendRoot())
+			return aioli.config.dirOpfs;
+		if(path.startsWith(`${aioli._opfsBackendRoot()}/`))
+			return `${aioli.config.dirOpfs}${path.slice(aioli._opfsBackendRoot().length)}`;
+		return path;
+	},
+
+	_opfsBackendRoot() {
+		return aioli._opfsBackend().root;
+	},
+
+	_opfsBackendInitFS(FS, module) {
+		return aioli._opfsBackend().initFS(FS, module);
+	},
+
+	async _opfsBackendStageFromOpfs(opfsPath, fsPath) {
+		return await aioli._opfsBackend().stageFromOpfs(opfsPath, fsPath);
+	},
+
+	async _opfsBackendFlushToOpfs(fsPath, opfsPath) {
+		return await aioli._opfsBackend().flushToOpfs(fsPath, opfsPath);
+	},
+
+	// OPFS backend contract:
+	// - root: filesystem path exposed inside the wasm runtime for the backend implementation
+	// - initFS(FS, module): prepare the backend root inside the module filesystem during startup
+	// - stageFromOpfs(opfsPath, fsPath): make browser OPFS content available at fsPath before a command
+	// - flushToOpfs(fsPath, opfsPath): persist content from fsPath back to browser OPFS after a command
+	//
+	// The staged backend implements this by copying through JS memory. A future direct backend
+	// should satisfy the same contract while mounting OPFS directly through module/runtime support
+	// and avoiding those copies.
+	_opfsBackend() {
+		switch (aioli.config.opfsBackend) {
+			case "staged":
+				return {
+					root: aioli.config.dirOpfsStage,
+					initFS(FS) {
+						FS.mkdirTree(aioli.config.dirOpfsStage);
+					},
+					async stageFromOpfs(opfsPath, fsPath) {
+						await aioli.copyFromOpfs(opfsPath, fsPath);
+					},
+					async flushToOpfs(fsPath, opfsPath) {
+						await aioli.copyToOpfs(fsPath, opfsPath);
+					},
+				};
+			case "direct":
+				return {
+					root: aioli.config.dirOpfs,
+					async initFS(FS, module) {
+						aioli._requireDirectOpfsSupport(module);
+						await aioli._directMount(FS);
+					},
+					async stageFromOpfs(opfsPath, fsPath) {
+						await aioli._directPrepareFile(fsPath, { create: false, truncate: false });
+						return fsPath;
+					},
+					async flushToOpfs(fsPath, opfsPath) {
+						await aioli._directPrepareFile(fsPath, {
+							create: false,
+							truncate: false,
+							opfsPath
+						});
+						return opfsPath;
+					},
+				};
+			default:
+				throw `Unsupported OPFS backend '${aioli.config.opfsBackend}'.`;
+		}
+	},
+
+	_supportsLegacyDirectOpfs() {
+		return aioli.config.opfsBackend === "direct"
+			&& typeof navigator?.storage?.getDirectory === "function"
+			&& typeof FileSystemFileHandle !== "undefined"
+			&& typeof FileSystemFileHandle.prototype?.createSyncAccessHandle === "function";
+	},
+
+	async _prepareDirectOpfsArgs(args = []) {
+		if(!aioli._supportsLegacyDirectOpfs())
+			return;
+
+		const outputFlags = new Set(["-o", "--output"]);
+		for(let i = 0; i < args.length; i++) {
+			const arg = args[i];
+			if(typeof arg !== "string" || !arg.startsWith(`${aioli.config.dirOpfs}/`))
+				continue;
+
+			const isOutput = i > 0 && outputFlags.has(args[i - 1]);
+			if(isOutput) {
+				await aioli._directPrepareFile(arg, { create: true, truncate: true });
+				continue;
+			}
+
+			try {
+				await aioli._directPrepareFile(arg, { create: false, truncate: false });
+			} catch (error) {
+				if(error?.name !== "NotFoundError")
+					throw error;
+			}
+		}
+	},
+
+	_directState(FS = aioli.fs) {
+		if(!aioli.directOpfs)
+			aioli.directOpfs = { FS, mounted: false, entries: new Map(), fsType: null };
+		if(FS && !aioli.directOpfs.FS)
+			aioli.directOpfs.FS = FS;
+		return aioli.directOpfs;
+	},
+
+	_directNormalizeFsPath(fsPath) {
+		if(fsPath === aioli.config.dirOpfs)
+			return aioli.config.dirOpfs;
+		return fsPath.replace(/\/+$/g, "");
+	},
+
+	_directToOpfsPath(fsPath) {
+		fsPath = aioli._directNormalizeFsPath(aioli._resolveFsPath(fsPath));
+		if(fsPath === aioli.config.dirOpfs)
+			return "/";
+		return fsPath.slice(aioli.config.dirOpfs.length) || "/";
+	},
+
+	_directErrno(code) {
+		const ERRNO_CODES = {
+			EEXIST: 20,
+			EINVAL: 28,
+			EISDIR: 31,
+			ENOENT: 44,
+			ENOSYS: 52,
+			ENOTDIR: 54,
+			ENOTEMPTY: 55,
+			EXDEV: 75,
+		};
+		return new aioli._directState().FS.ErrnoError(ERRNO_CODES[code] || ERRNO_CODES.EINVAL);
+	},
+
+	async _directMount(FS) {
+		const state = aioli._directState(FS);
+		if(state.mounted)
+			return;
+
+		const createNode = (parent, name, mode, dev = 0, mount = parent?.mount || null, opfsPath = "/") => {
+			const node = FS.createNode(parent, name, mode, dev);
+			node.mount = mount;
+			node.timestamp = Date.now();
+			node.opfsPath = opfsPath;
+			if(FS.isDir(mode)) {
+				node.contents = {};
+				node.node_ops = nodeOps.dir;
+				node.stream_ops = streamOps.dir;
+			} else if(FS.isFile(mode)) {
+				node.node_ops = nodeOps.file;
+				node.stream_ops = streamOps.file;
+			}
+			if(parent) {
+				parent.contents[name] = node;
+				parent.timestamp = node.timestamp;
+			}
+			return node;
+		};
+
+		const statForNode = node => {
+			const size = FS.isDir(node.mode)
+				? 4096
+				: node.opfsEntry?.size ?? 0;
+			return {
+				dev: 1,
+				ino: node.id,
+				mode: node.mode,
+				nlink: 1,
+				uid: 0,
+				gid: 0,
+				rdev: node.rdev,
+				size,
+				atime: new Date(node.timestamp),
+				mtime: new Date(node.timestamp),
+				ctime: new Date(node.timestamp),
+				blksize: 4096,
+				blocks: Math.max(1, Math.ceil(size / 4096))
+			};
+		};
+
+		const lookupPath = (parent, name) => {
+			if(!FS.isDir(parent.mode))
+				throw aioli._directErrno("ENOTDIR");
+			const child = parent.contents[name];
+			if(!child)
+				throw aioli._directErrno("ENOENT");
+			return child;
+		};
+
+		const streamOps = {
+			dir: {
+				llseek() {
+					throw aioli._directErrno("EINVAL");
+				},
+			},
+			file: {
+				open(stream) {
+					const entry = stream.node.opfsEntry;
+					if(!entry?.accessHandle)
+						throw aioli._directErrno("ENOSYS");
+					stream.position = 0;
+				},
+				close(stream) {
+					const entry = stream.node.opfsEntry;
+					if(entry?.accessHandle)
+						entry.accessHandle.flush();
+				},
+				read(stream, buffer, offset, length, position) {
+					const entry = stream.node.opfsEntry;
+					if(!entry?.accessHandle)
+						throw aioli._directErrno("ENOENT");
+					const target = buffer.subarray(offset, offset + length);
+					const at = position ?? stream.position ?? 0;
+					const bytesRead = entry.accessHandle.read(target, { at }) || 0;
+					if(position == null)
+						stream.position = at + bytesRead;
+					return bytesRead;
+				},
+				write(stream, buffer, offset, length, position) {
+					const entry = stream.node.opfsEntry;
+					if(!entry?.accessHandle)
+						throw aioli._directErrno("ENOENT");
+					const source = buffer.subarray(offset, offset + length);
+					const at = position ?? stream.position ?? 0;
+					const bytesWritten = entry.accessHandle.write(source, { at }) || 0;
+					entry.accessHandle.flush();
+					entry.size = Math.max(entry.size || 0, at + bytesWritten);
+					entry.timestamp = Date.now();
+					stream.node.timestamp = entry.timestamp;
+					if(position == null)
+						stream.position = at + bytesWritten;
+					return bytesWritten;
+				},
+				llseek(stream, offset, whence) {
+					const entry = stream.node.opfsEntry;
+					const size = entry?.size ?? 0;
+					let position = offset;
+					if(whence === 1)
+						position += stream.position;
+					else if(whence === 2)
+						position += size;
+					if(position < 0)
+						throw aioli._directErrno("EINVAL");
+					stream.position = position;
+					return position;
+				},
+				allocate(stream, offset, length) {
+					const entry = stream.node.opfsEntry;
+					if(!entry?.accessHandle)
+						throw aioli._directErrno("ENOENT");
+					const size = offset + length;
+					entry.accessHandle.truncate(size);
+					entry.size = size;
+					entry.timestamp = Date.now();
+					stream.node.timestamp = entry.timestamp;
+				},
+			},
+		};
+
+		const nodeOps = {
+			dir: {
+				getattr: statForNode,
+				setattr(node, attr) {
+					if(attr.mode != null)
+						node.mode = attr.mode;
+					if(attr.timestamp != null)
+						node.timestamp = attr.timestamp;
+				},
+				lookup: lookupPath,
+				mknod(parent, name, mode, dev) {
+					const opfsPath = parent.opfsPath === "/" ? `/${name}` : `${parent.opfsPath}/${name}`;
+					const node = createNode(parent, name, mode, dev, parent.mount, opfsPath);
+					const entry = state.entries.get(opfsPath);
+					if(entry) {
+						node.opfsEntry = entry;
+						entry.node = node;
+					}
+					return node;
+				},
+				mkdir(parent, name, mode) {
+					return this.mknod(parent, name, mode, 0);
+				},
+				readdir(node) {
+					return [".", "..", ...Object.keys(node.contents).sort()];
+				},
+				unlink(parent, name) {
+					const node = lookupPath(parent, name);
+					if(FS.isDir(node.mode))
+						throw aioli._directErrno("EISDIR");
+					delete parent.contents[name];
+					aioli._directForgetPath(aioli._resolveFsPath(`${aioli.config.dirOpfs}${node.opfsPath}`));
+				},
+				rmdir(parent, name) {
+					const node = lookupPath(parent, name);
+					if(Object.keys(node.contents).length > 0)
+						throw aioli._directErrno("ENOTEMPTY");
+					delete parent.contents[name];
+				},
+				rename(oldNode, newDir, newName) {
+					if(oldNode.parent !== newDir)
+						throw aioli._directErrno("EXDEV");
+					delete oldNode.parent.contents[oldNode.name];
+					oldNode.name = newName;
+					newDir.contents[newName] = oldNode;
+				},
+				symlink() {
+					throw aioli._directErrno("ENOSYS");
+				},
+			},
+			file: {
+				getattr: statForNode,
+				setattr(node, attr) {
+					const entry = node.opfsEntry;
+					if(attr.mode != null)
+						node.mode = attr.mode;
+					if(attr.timestamp != null)
+						node.timestamp = attr.timestamp;
+					if(attr.size != null && entry?.accessHandle) {
+						entry.accessHandle.truncate(attr.size);
+						entry.accessHandle.flush();
+						entry.size = attr.size;
+						entry.timestamp = Date.now();
+						node.timestamp = entry.timestamp;
+					}
+				},
+			},
+		};
+
+		state.fsType = {
+			mount: mount => createNode(null, "/", 16895, 0, mount, "/"),
+			createNode,
+		};
+
+		if(!FS.analyzePath(aioli.config.dirOpfs).exists)
+			FS.mkdir(aioli.config.dirOpfs);
+		FS.mount(state.fsType, {}, aioli.config.dirOpfs);
+		state.mounted = true;
+	},
+
+	_directEnsureFsDir(fsPath) {
+		const state = aioli._directState();
+		fsPath = aioli._directNormalizeFsPath(aioli._resolveFsPath(fsPath));
+		if(fsPath === aioli.config.dirOpfs)
+			return aioli.fs.lookupPath(aioli.config.dirOpfs).node;
+
+		const parts = fsPath.slice(aioli.config.dirOpfs.length).split("/").filter(Boolean);
+		let current = aioli.fs.lookupPath(aioli.config.dirOpfs).node;
+		let currentOpfs = "";
+		for(const part of parts) {
+			currentOpfs += `/${part}`;
+			if(!current.contents[part])
+				current = state.fsType.createNode(current, part, 16895, 0, current.mount, currentOpfs);
+			else
+				current = current.contents[part];
+		}
+		return current;
+	},
+
+	_directEntryForFsPath(fsPath) {
+		return aioli._directState().entries.get(aioli._directToOpfsPath(fsPath));
+	},
+
+	async _directEnsureDir(fsPath) {
+		if(!aioli._supportsLegacyDirectOpfs())
+			return;
+		fsPath = aioli._directNormalizeFsPath(aioli._resolveFsPath(fsPath));
+		if(fsPath === aioli.config.dirOpfs)
+			return aioli._directEnsureFsDir(fsPath);
+		await aioli._opfsLookup(aioli._directToOpfsPath(fsPath), { create: true, directory: true });
+		return aioli._directEnsureFsDir(fsPath);
+	},
+
+	async _directPrepareFile(fsPath, options = {}) {
+		if(!aioli._supportsLegacyDirectOpfs())
+			throw new Error("Direct OPFS support is not available in this environment.");
+
+		const state = aioli._directState();
+		fsPath = aioli._directNormalizeFsPath(aioli._resolveFsPath(fsPath));
+		const opfsPath = options.opfsPath || aioli._directToOpfsPath(fsPath);
+		const dirFsPath = fsPath.split("/").slice(0, -1).join("/") || aioli.config.dirOpfs;
+		await aioli._directEnsureDir(dirFsPath);
+		const fileHandle = await aioli._opfsLookup(opfsPath, { create: options.create === true });
+		let entry = state.entries.get(opfsPath);
+		if(entry?.accessHandle && entry.fileHandle !== fileHandle) {
+			entry.accessHandle.close();
+			entry = null;
+		}
+		if(!entry) {
+			const accessHandle = await fileHandle.createSyncAccessHandle();
+			entry = {
+				opfsPath,
+				fileHandle,
+				accessHandle,
+				size: accessHandle.getSize(),
+				timestamp: Date.now(),
+				node: null,
+			};
+			state.entries.set(opfsPath, entry);
+		}
+		if(options.truncate === true) {
+			entry.accessHandle.truncate(0);
+			entry.accessHandle.flush();
+			entry.size = 0;
+			entry.timestamp = Date.now();
+		} else {
+			entry.size = entry.accessHandle.getSize();
+		}
+
+		const info = aioli.fs.analyzePath(fsPath);
+		let node = info.exists ? info.object : null;
+		if(!node) {
+			const parent = aioli._directEnsureFsDir(dirFsPath);
+			node = state.fsType.createNode(parent, fsPath.split("/").pop(), 33279, 0, parent.mount, opfsPath);
+		}
+		node.opfsEntry = entry;
+		node.timestamp = entry.timestamp;
+		entry.node = node;
+		return entry;
+	},
+
+	_directForgetPath(fsPath, options = {}) {
+		if(!aioli.directOpfs)
+			return;
+		fsPath = aioli._directNormalizeFsPath(aioli._resolveFsPath(fsPath));
+		const opfsPath = aioli._directToOpfsPath(fsPath);
+		for(const [key, entry] of aioli.directOpfs.entries.entries()) {
+			if(key === opfsPath || (options.recursive === true && key.startsWith(`${opfsPath}/`))) {
+				try {
+					entry.accessHandle?.close();
+				} catch (error) {}
+				aioli.directOpfs.entries.delete(key);
+			}
+		}
+	},
+
+	_moduleSupportsDirectOpfs(module) {
+		return typeof module?.mountOpfs === "function" && module.mountOpfs.__biowasmStub !== true;
 	},
 
 	// Log if debug enabled

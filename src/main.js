@@ -17,8 +17,14 @@ const CONFIG_DEFAULTS = {
 	// so that operations like "samtools index" don't crash due to the read-only nature of WORKERS).
 	// Also mount URLs lazily in that folder.
 	dirData: "/data",
-	// Staged workspace that mirrors selected files to/from browser OPFS.
-	dirOpfs: "/shared/opfs",
+	// Public OPFS path presented to callers. The current implementation stages this
+	// under dirOpfsStage until direct OPFS mounts are available.
+	dirOpfs: "/opfs",
+	// Current implementation backend for OPFS integration.
+	// "direct" is reserved for a future native OPFS mount implementation.
+	opfsBackend: "staged",
+	// Internal staged workspace that mirrors selected files to/from browser OPFS.
+	dirOpfsStage: "/shared/opfs",
 	// Interleave stdout/stderr. If set to false, `.exec()` returns an object { "stdout": <text>, "stderr": <text> }
 	printInterleaved: true,
 	// Stream stdout/stderr continuously to the main thread, instead of waiting for the WebWorker to finish running a command.

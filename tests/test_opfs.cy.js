@@ -15,8 +15,33 @@ const TOOLS_LOCAL = [
 ];
 
 describe("OPFS utilities", () => {
+	it("supports the direct OPFS backend for explicit output paths", async () => {
+		const CLI = await new Aioli(TOOLS_LOCAL, { debug: true, opfsBackend: "direct" });
+		await clearOpfs();
+
+		await CLI.mkdir("/opfs/results");
+		const stderr = await CLI.exec(
+			"samtools fastq -0 /opfs/results/toy.fastq -o /opfs/results/toy.fastq /shared/samtools/examples/toy.sam",
+			null,
+			{ sync: "/results/toy.fastq" }
+		);
+
+		expect(stderr).to.equal(`[M::bam2fq_mainloop] discarded 0 singletons\n[M::bam2fq_mainloop] processed 12 reads\n`);
+		expect(await CLI.opfsRead("/results/toy.fastq")).to.include("@r001");
+		expect(await CLI.cat("/opfs/results/toy.fastq")).to.include("@r001");
+	});
+
+	it("reports OPFS direct-mount capability for the current module", async () => {
+		const CLI = await new Aioli(TOOLS_LOCAL, { debug: true, opfsBackend: "staged" });
+		const support = await CLI.opfsSupport();
+		expect(support.backend).to.equal("staged");
+		expect(support.available).to.equal(false);
+		expect(support.reason).to.be.a("string");
+		expect(support.source).to.be.a("string");
+	});
+
 	it("writes, lists, persists, copies, and deletes OPFS files", async () => {
-		const CLI = await new Aioli(TOOLS_LOCAL, { debug: true });
+		const CLI = await new Aioli(TOOLS_LOCAL, { debug: true, opfsBackend: "staged" });
 		await clearOpfs();
 
 		await CLI.opfsMkdir("/results");
@@ -69,21 +94,35 @@ describe("OPFS utilities", () => {
 		]);
 	});
 
-	it("stages tool-visible /opfs paths for command input and output", async () => {
+	it("stages public /opfs paths for command input and output", async () => {
 		const CLI = await new Aioli(TOOLS_LOCAL, { debug: true });
 		await clearOpfs();
 
 		await CLI.opfsWrite("/inputs/message.txt", "hello staged opfs");
-		await CLI.opfsStage("/inputs/message.txt");
-		const catOutput = await CLI.exec("cat /shared/opfs/inputs/message.txt");
+		const stagedPath = await CLI.opfsStage("/inputs/message.txt");
+		expect(stagedPath).to.equal("/opfs/inputs/message.txt");
+
+		await CLI.cd("/opfs/inputs");
+		expect(await CLI.pwd()).to.equal("/opfs/inputs");
+
+		const catOutput = await CLI.exec("cat /opfs/inputs/message.txt");
 		expect(catOutput).to.equal("hello staged opfs\n");
 
-		await CLI.mkdir("/shared/opfs/results");
-		await CLI.exec("samtools view -o /shared/opfs/results/toy.sam /shared/samtools/examples/toy.sam");
-		await CLI.opfsFlush("/shared/opfs/results/toy.sam", "/results/toy.sam");
+		await CLI.mkdir("/opfs/results");
+		await CLI.exec("samtools view -o /opfs/results/toy.sam /shared/samtools/examples/toy.sam");
+		await CLI.opfsFlush("/opfs/results/toy.sam", "/results/toy.sam");
 
 		const persisted = await CLI.opfsRead("/results/toy.sam");
 		expect(persisted).to.include("r001");
+	});
+
+	it("reports direct OPFS support from the Aioli legacy-FS runtime", async () => {
+		const CLI = await new Aioli(TOOLS_LOCAL, { debug: true, opfsBackend: "direct" });
+		const support = await CLI.opfsSupport();
+		expect(support.backend).to.equal("direct");
+		expect(support.available).to.equal(true);
+		expect(support.reason).to.equal(null);
+		expect(support.source).to.equal("aioli-legacyfs");
 	});
 });
 
