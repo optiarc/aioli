@@ -17,6 +17,8 @@ const CONFIG_DEFAULTS = {
 	// so that operations like "samtools index" don't crash due to the read-only nature of WORKERS).
 	// Also mount URLs lazily in that folder.
 	dirData: "/data",
+	// Staged workspace that mirrors selected files to/from browser OPFS.
+	dirOpfs: "/shared/opfs",
 	// Interleave stdout/stderr. If set to false, `.exec()` returns an object { "stdout": <text>, "stderr": <text> }
 	printInterleaved: true,
 	// Stream stdout/stderr continuously to the main thread, instead of waiting for the WebWorker to finish running a command.

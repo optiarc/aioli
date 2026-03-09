@@ -20,6 +20,7 @@ const aioli = {
 	files: [],   // File/Blob objects that represent local user files we mount to a virtual filesystem
 	base: {},    // Base module (e.g. aioli.tools[0]; not always [0], see init())
 	fs: {},      // Base module's filesystem (e.g. aioli.tools[0].module.FS)
+	opfsRoot: null, // Browser OPFS root handle; used for persistent storage utilities
 
 	// =========================================================================
 	// Initialize the WebAssembly module(s)
@@ -158,7 +159,7 @@ const aioli = {
 	// =========================================================================
 	// Execute a command
 	// =========================================================================
-	async exec(command, args=null) {
+	async exec(command, args=null, options={}) {
 		// Input validation
 		aioli._log(`Executing %c${command}%c args=${args}`, "color:darkblue; font-weight:bold", "");
 		if(!command)
@@ -191,6 +192,9 @@ const aioli = {
 			await this._initModules();
 		}
 
+		if(options.sync != null)
+			await aioli._syncPathsFromOpfs(options.sync);
+
 		// Run command. Stdout/Stderr will be saved to "tool.stdout"/"tool.stderr" (see "print" and "printErr" above)
 		try {
 			tool.module.callMain(args);
@@ -213,6 +217,11 @@ const aioli = {
 		let result = { stdout: tool.stdout, stderr: tool.stderr };
 		if(aioli.config.printInterleaved)
 			result = tool.stdout;
+
+		if(options.persist != null)
+			await aioli._persistOutputs(options.persist);
+		if(options.sync != null)
+			await aioli._syncPathsToOpfs(options.sync);
 
 		// Reinitialize module after done? This is useful for tools that don't properly reset their global state the
 		// second time the `main()` function is called.
@@ -301,6 +310,91 @@ const aioli = {
 	async close() {
 		aioli._log("Closing worker...");
 		self.close();
+	},
+
+	// =========================================================================
+	// OPFS utilities
+	// =========================================================================
+	async opfsMkdir(path) {
+		await aioli._opfsLookup(path, { create: true, directory: true });
+		return true;
+	},
+
+	async opfsWrite(path, data = "") {
+		const handle = await aioli._opfsLookup(path, { create: true });
+		const writable = await handle.createWritable();
+		try {
+			await writable.write(data);
+		} finally {
+			await writable.close();
+		}
+		return true;
+	},
+
+	async opfsRead(path, options = {}) {
+		const format = options.encoding || options.format || "text";
+		const handle = await aioli._opfsLookup(path);
+		const file = await handle.getFile();
+		if(format === "arrayBuffer")
+			return await file.arrayBuffer();
+		if(format === "blob")
+			return file;
+		return await file.text();
+	},
+
+	async opfsList(path = "/") {
+		const dir = await aioli._opfsLookup(path, { directory: true });
+		const entries = [];
+		for await (const [name, handle] of dir.entries()) {
+			entries.push({
+				name,
+				kind: handle.kind
+			});
+		}
+		entries.sort((a, b) => a.name.localeCompare(b.name));
+		return entries;
+	},
+
+	async opfsDelete(path, options = {}) {
+		const parts = aioli._splitOpfsPath(path);
+		if(parts.length === 0)
+			throw "Cannot delete the OPFS root.";
+
+		const name = parts.pop();
+		const parent = await aioli._opfsLookup(parts.join("/"), { directory: true });
+		await parent.removeEntry(name, { recursive: options.recursive === true });
+		return true;
+	},
+
+	async opfsStage(opfsPath, fsPath = null) {
+		const targetPath = fsPath || `${aioli.config.dirOpfs}${opfsPath}`;
+		await aioli.copyFromOpfs(opfsPath, targetPath);
+		return targetPath;
+	},
+
+	async opfsFlush(fsPath, opfsPath = null) {
+		const targetPath = opfsPath || aioli._defaultOpfsPath(fsPath);
+		await aioli.copyToOpfs(fsPath, targetPath);
+		return targetPath;
+	},
+
+	async copyToOpfs(fsPath, opfsPath = null) {
+		if(!opfsPath)
+			opfsPath = `/${fsPath.split("/").pop()}`;
+		const data = aioli.fs.readFile(fsPath);
+		await aioli.opfsWrite(opfsPath, data);
+		return opfsPath;
+	},
+
+	async copyFromOpfs(opfsPath, fsPath = null) {
+		if(!fsPath)
+			fsPath = opfsPath;
+		const data = new Uint8Array(await aioli.opfsRead(opfsPath, { format: "arrayBuffer" }));
+		const dir = fsPath.split("/").slice(0, -1).join("/");
+		if(dir)
+			aioli.fs.mkdirTree(dir);
+		aioli.fs.writeFile(fsPath, data);
+		return fsPath;
 	},
 
 	// =========================================================================
@@ -426,6 +520,7 @@ const aioli = {
 			FS.mkdir(aioli.config.dirShared, 0o777);
 			FS.mkdir(`${aioli.config.dirShared}/${aioli.config.dirData}`, 0o777);
 			FS.mkdir(`${aioli.config.dirShared}/${aioli.config.dirMounted}`, 0o777);
+			FS.mkdirTree(aioli.config.dirOpfs);
 			FS.chdir(`${aioli.config.dirShared}/${aioli.config.dirData}`);
 			aioli.fs = FS;
 
@@ -484,6 +579,101 @@ const aioli = {
 	// =========================================================================
 	// Utilities
 	// =========================================================================
+	async _opfsRootHandle() {
+		if(aioli.opfsRoot)
+			return aioli.opfsRoot;
+		if(!navigator?.storage?.getDirectory)
+			throw "OPFS is not available in this environment.";
+		aioli.opfsRoot = await navigator.storage.getDirectory();
+		return aioli.opfsRoot;
+	},
+
+	_splitOpfsPath(path = "/") {
+		if(typeof path !== "string")
+			throw "OPFS path must be a string.";
+		return path.split("/").filter(Boolean);
+	},
+
+	async _opfsLookup(path = "/", options = {}) {
+		const parts = aioli._splitOpfsPath(path);
+		const wantDirectory = options.directory === true;
+		let dir = await aioli._opfsRootHandle();
+
+		if(parts.length === 0) {
+			if(wantDirectory)
+				return dir;
+			throw "OPFS root is a directory.";
+		}
+
+		for(let i = 0; i < parts.length - 1; i++)
+			dir = await dir.getDirectoryHandle(parts[i], { create: options.create === true });
+
+		const leaf = parts.at(-1);
+		if(wantDirectory)
+			return await dir.getDirectoryHandle(leaf, { create: options.create === true });
+		return await dir.getFileHandle(leaf, { create: options.create === true });
+	},
+
+	async _persistOutputs(persist) {
+		if(!Array.isArray(persist))
+			persist = [persist];
+
+		for(let item of persist) {
+			if(typeof item === "string")
+				item = { from: item };
+			if(!item?.from)
+				throw "Persist entries must define a source path.";
+
+			const to = item.to || `/${item.from.split("/").pop()}`;
+			await aioli.copyToOpfs(item.from, to);
+		}
+	},
+
+	_defaultOpfsPath(fsPath) {
+		if(fsPath.startsWith(`${aioli.config.dirOpfs}/`))
+			return fsPath.slice(aioli.config.dirOpfs.length);
+		if(fsPath === aioli.config.dirOpfs)
+			return "/";
+		return `/${fsPath.split("/").filter(Boolean).pop()}`;
+	},
+
+	async _syncPathsFromOpfs(sync) {
+		if(!Array.isArray(sync))
+			sync = [sync];
+
+		for(let item of sync) {
+			if(typeof item === "string")
+				item = { path: item };
+
+			const opfsPath = item.opfs || item.path;
+			const fsPath = item.fs || `${aioli.config.dirOpfs}${opfsPath}`;
+			try {
+				await aioli.opfsStage(opfsPath, fsPath);
+			} catch(error) {
+				// Output paths often do not exist in OPFS yet on the way into a command.
+				if(error?.name !== "NotFoundError" || item.skipMissing === false)
+					throw error;
+			}
+		}
+	},
+
+	async _syncPathsToOpfs(sync) {
+		if(!Array.isArray(sync))
+			sync = [sync];
+
+		for(let item of sync) {
+			if(typeof item === "string")
+				item = { path: item };
+
+			const opfsPath = item.opfs || item.path;
+			const fsPath = item.fs || `${aioli.config.dirOpfs}${opfsPath}`;
+			const info = aioli.fs.analyzePath(fsPath);
+			if(!info.exists)
+				continue;
+			await aioli.opfsFlush(fsPath, opfsPath);
+		}
+	},
+
 	// Common file operations
 	_fileop(operation, path) {
 		aioli._log(`Running ${operation} ${path}`);
