@@ -195,7 +195,7 @@ const aioli = {
 		}
 
 		if(aioli.config.opfsBackend === "direct")
-			await aioli._prepareDirectOpfsArgs(args);
+			await aioli._prepareDirectOpfsArgs(toolName, args);
 
 		if(options.sync != null)
 			await aioli._syncPathsFromOpfs(options.sync);
@@ -929,7 +929,7 @@ const aioli = {
 			&& typeof FileSystemFileHandle.prototype?.createSyncAccessHandle === "function";
 	},
 
-	async _prepareDirectOpfsArgs(args = []) {
+	async _prepareDirectOpfsArgs(toolName, args = []) {
 		if(!aioli._supportsLegacyDirectOpfs())
 			return;
 
@@ -951,6 +951,29 @@ const aioli = {
 				if(error?.name !== "NotFoundError")
 					throw error;
 			}
+		}
+
+		await aioli._prepareImplicitDirectOpfsOutputs(toolName, args);
+	},
+
+	async _prepareImplicitDirectOpfsOutputs(toolName, args = []) {
+		if(toolName !== "samtools")
+			return;
+
+		const subcommand = args[0];
+		if(subcommand === "index") {
+			const inputPath = args.find(arg => typeof arg === "string" && arg.startsWith(`${aioli.config.dirOpfs}/`) && !arg.startsWith("-"));
+			if(!inputPath)
+				return;
+			await aioli._directPrepareFile(`${inputPath}.bai`, { create: true, truncate: true });
+			return;
+		}
+
+		if(subcommand === "faidx") {
+			const inputPath = args.find(arg => typeof arg === "string" && arg.startsWith(`${aioli.config.dirOpfs}/`) && !arg.startsWith("-"));
+			if(!inputPath)
+				return;
+			await aioli._directPrepareFile(`${inputPath}.fai`, { create: true, truncate: true });
 		}
 	},
 
@@ -986,7 +1009,8 @@ const aioli = {
 			ENOTEMPTY: 55,
 			EXDEV: 75,
 		};
-		return new aioli._directState().FS.ErrnoError(ERRNO_CODES[code] || ERRNO_CODES.EINVAL);
+		const ErrnoError = aioli._directState().FS.ErrnoError;
+		return new ErrnoError(ERRNO_CODES[code] || ERRNO_CODES.EINVAL);
 	},
 
 	async _directMount(FS) {

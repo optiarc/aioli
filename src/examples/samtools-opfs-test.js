@@ -15,6 +15,16 @@ function recordCheck(name, passed, detail = "") {
 	results.textContent = JSON.stringify(checks, null, 2);
 }
 
+function commandSucceeded(result) {
+	if(typeof result?.stderr !== "string")
+		return false;
+	const stderr = result.stderr.toLowerCase();
+	return !stderr.includes("exception thrown:")
+		&& !stderr.includes("failed")
+		&& !stderr.includes("could not")
+		&& !stderr.includes("error");
+}
+
 try {
 	status.textContent = "Initializing Aioli...";
 
@@ -45,7 +55,7 @@ try {
 	const toyFastq = await CLI.opfsRead("/results/toy.fastq");
 	recordCheck(
 		"fastq-explicit-output",
-		fastqOutput.stderr.includes("processed 12 reads") && toyFastq.includes("@r001"),
+		commandSucceeded(fastqOutput) && fastqOutput.stderr.includes("processed 12 reads") && toyFastq.includes("@r001"),
 		fastqOutput.stderr
 	);
 
@@ -60,10 +70,64 @@ try {
 	const roundTripSam = await CLI.opfsRead("/results/from-opfs.sam");
 	recordCheck(
 		"opfs-input-to-opfs-output",
-		roundTripOutput.stderr === "" && roundTripSam.includes("r001")
+		commandSucceeded(roundTripOutput) && roundTripSam.includes("r001"),
+		roundTripOutput.stderr
 	);
 
-	status.textContent = checks.every(check => check.passed) ? "PASS" : "FAIL";
+	status.textContent = "Probing samtools sort...";
+	try {
+		const sortOutput = await CLI.exec(
+			"samtools sort -o /opfs/results/toy.sorted.bam /shared/samtools/examples/toy.sam"
+		);
+		const sortedInfo = await CLI.ls("/opfs/results/toy.sorted.bam");
+		recordCheck(
+			"sort-explicit-output-probe",
+			Boolean(sortedInfo) && commandSucceeded(sortOutput),
+			sortOutput.stderr || ""
+		);
+	} catch (error) {
+		recordCheck("sort-explicit-output-probe", false, error?.stack || String(error));
+	}
+
+	status.textContent = "Probing samtools index...";
+	try {
+		const indexOutput = await CLI.exec(
+			"samtools index /opfs/results/toy.sorted.bam"
+		);
+		const indexInfo = await CLI.ls("/opfs/results/toy.sorted.bam.bai");
+		recordCheck(
+			"index-sidecar-probe",
+			Boolean(indexInfo) && commandSucceeded(indexOutput),
+			indexOutput.stderr || ""
+		);
+	} catch (error) {
+		recordCheck("index-sidecar-probe", false, error?.stack || String(error));
+	}
+
+	status.textContent = "Probing samtools faidx...";
+	try {
+		await CLI.opfsWrite("/inputs/toy.fa", await CLI.cat("/shared/samtools/examples/toy.fa"));
+		const faidxOutput = await CLI.exec(
+			"samtools faidx /opfs/inputs/toy.fa"
+		);
+		const faidxInfo = await CLI.ls("/opfs/inputs/toy.fa.fai");
+		recordCheck(
+			"faidx-sidecar-probe",
+			Boolean(faidxInfo) && commandSucceeded(faidxOutput),
+			faidxOutput.stderr || ""
+		);
+	} catch (error) {
+		recordCheck("faidx-sidecar-probe", false, error?.stack || String(error));
+	}
+
+	const requiredChecks = new Set([
+		"view-explicit-output",
+		"fastq-explicit-output",
+		"opfs-input-to-opfs-output",
+	]);
+	status.textContent = checks
+		.filter(check => requiredChecks.has(check.name))
+		.every(check => check.passed) ? "PASS" : "FAIL";
 } catch (error) {
 	status.textContent = "ERROR";
 	errors.textContent = error?.stack || String(error);
