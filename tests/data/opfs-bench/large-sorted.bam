@@ -1,0 +1,3 @@
+PLACEHOLDER
+Replace this file with a valid BAM before running samtools OPFS benchmarks.
+See large-sorted.sam for a tiny SAM source fixture.
