@@ -74,37 +74,37 @@ try {
 		roundTripOutput.stderr
 	);
 
-	status.textContent = "Probing samtools sort...";
+	status.textContent = "Running samtools sort...";
 	try {
 		const sortOutput = await CLI.exec(
 			"samtools sort -o /opfs/results/toy.sorted.bam /shared/samtools/examples/toy.sam"
 		);
 		const sortedInfo = await CLI.ls("/opfs/results/toy.sorted.bam");
 		recordCheck(
-			"sort-explicit-output-probe",
+			"sort-explicit-output",
 			Boolean(sortedInfo) && commandSucceeded(sortOutput),
 			sortOutput.stderr || ""
 		);
 	} catch (error) {
-		recordCheck("sort-explicit-output-probe", false, error?.stack || String(error));
+		recordCheck("sort-explicit-output", false, error?.stack || String(error));
 	}
 
-	status.textContent = "Probing samtools index...";
+	status.textContent = "Running samtools index...";
 	try {
 		const indexOutput = await CLI.exec(
 			"samtools index /opfs/results/toy.sorted.bam"
 		);
 		const indexInfo = await CLI.ls("/opfs/results/toy.sorted.bam.bai");
 		recordCheck(
-			"index-sidecar-probe",
+			"index-sidecar",
 			Boolean(indexInfo) && commandSucceeded(indexOutput),
 			indexOutput.stderr || ""
 		);
 	} catch (error) {
-		recordCheck("index-sidecar-probe", false, error?.stack || String(error));
+		recordCheck("index-sidecar", false, error?.stack || String(error));
 	}
 
-	status.textContent = "Probing samtools faidx...";
+	status.textContent = "Running samtools faidx...";
 	try {
 		await CLI.opfsWrite("/inputs/toy.fa", await CLI.cat("/shared/samtools/examples/toy.fa"));
 		const faidxOutput = await CLI.exec(
@@ -112,18 +112,21 @@ try {
 		);
 		const faidxInfo = await CLI.ls("/opfs/inputs/toy.fa.fai");
 		recordCheck(
-			"faidx-sidecar-probe",
+			"faidx-sidecar",
 			Boolean(faidxInfo) && commandSucceeded(faidxOutput),
 			faidxOutput.stderr || ""
 		);
 	} catch (error) {
-		recordCheck("faidx-sidecar-probe", false, error?.stack || String(error));
+		recordCheck("faidx-sidecar", false, error?.stack || String(error));
 	}
 
 	const requiredChecks = new Set([
 		"view-explicit-output",
 		"fastq-explicit-output",
 		"opfs-input-to-opfs-output",
+		"sort-explicit-output",
+		"index-sidecar",
+		"faidx-sidecar",
 	]);
 	status.textContent = checks
 		.filter(check => requiredChecks.has(check.name))
