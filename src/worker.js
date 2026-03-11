@@ -18,6 +18,7 @@ const aioli = {
 	tools: [],   // Tools that are available to use in this WebWorker
 	config: {},  // See main.js for defaults
 	files: [],   // File/Blob objects that represent local user files we mount to a virtual filesystem
+	inputFiles: [], // File/Blob objects mounted read-only under the public /input path
 	base: {},    // Base module (e.g. aioli.tools[0]; not always [0], see init())
 	fs: {},      // Base module's filesystem (e.g. aioli.tools[0].module.FS)
 	opfsRoot: null, // Browser OPFS root handle; used for persistent storage utilities
@@ -85,8 +86,24 @@ const aioli = {
 	//		])
 	// =========================================================================
 	mount(files=[]) {
-		const dirData = `${aioli.config.dirShared}${aioli.config.dirData}`;
-		const dirMounted = `${aioli.config.dirShared}${aioli.config.dirMounted}`;
+		return aioli._mountFiles(files, `${aioli.config.dirShared}${aioli.config.dirData}`, "files");
+	},
+
+	mountInputs(files=[]) {
+		return aioli._mountFiles(files, aioli.config.dirInput, "inputFiles");
+	},
+
+	listInputs() {
+		return aioli._fileop("ls", aioli.config.dirInput);
+	},
+
+	unmountInputs() {
+		aioli.inputFiles = [];
+		aioli._remountFiles();
+		return true;
+	},
+
+	_mountFiles(files=[], targetDir, stateKey) {
 		let toMountFiles = [], toMountURLs = [], mountedPaths = [];
 
 		// Input validation: auto convert singletons to array for convenience
@@ -122,39 +139,59 @@ const aioli = {
 			mountedPaths.push(file.name);
 		}
 
-		// Unmount and remount files since WORKERFS is read-only (i.e. can only mount a folder once)
+		aioli[stateKey] = aioli[stateKey].concat(toMountFiles);
+		aioli._remountFiles();
+		aioli._ensureDir(targetDir);
+
+		for(let file of toMountURLs)
+			aioli._ensureLazyFile(targetDir, file);
+		for(let file of toMountFiles)
+			aioli._ensureSymlink(targetDir, file.name);
+
+		return mountedPaths.map(path => `${targetDir}/${path}`);
+	},
+
+	_remountFiles() {
+		const dirMounted = `${aioli.config.dirShared}${aioli.config.dirMounted}`;
 		try {
 			aioli.fs.unmount(dirMounted);
 		} catch(e) {}
 
-		// Lazy-mount URLs, i.e. don't download any of them, but will automatically do
-		// HTTP Range requests when a tool requests a subset of bytes from a file.
-		for(let file of toMountURLs)
-			aioli.fs.createLazyFile(dirData, file.name, file.url, true, true);
-
-		// Mount files (save for later for the next time we need to remount them)
-		aioli.files = aioli.files.concat(toMountFiles);
+		const allFiles = aioli.files.concat(aioli.inputFiles);
 		aioli.base.module.FS.mount(aioli.base.module.WORKERFS, {
-			files: aioli.files.filter(f => f instanceof File),
-			blobs: aioli.files.filter(f => f?.data instanceof Blob)
+			files: allFiles.filter(f => f instanceof File),
+			blobs: allFiles.filter(f => f?.data instanceof Blob)
 		}, dirMounted);
 
-		// Create symlinks for convenience. The folder "dirMounted" is a WORKERFS, which is read-only. By adding
-		// symlinks to a separate writeable folder "dirData", we can support commands like "samtools index abc.bam",
-		// which create a "abc.bam.bai" file in the same path where the .bam file is created.
-		toMountFiles.map(file => {
-			const oldpath = `${dirMounted}/${file.name}`;
-			const newpath = `${dirData}/${file.name}`;
-			try {
-				aioli.fs.unlink(newpath);
-			} catch(e) {}
-			aioli._log(`Creating symlink: ${newpath} --> ${oldpath}`)
+		for(let file of aioli.files)
+			aioli._ensureSymlink(`${aioli.config.dirShared}${aioli.config.dirData}`, file.name);
+		for(let file of aioli.inputFiles)
+			aioli._ensureSymlink(aioli.config.dirInput, file.name);
+	},
 
-			// Create symlink within first module's filesystem (note: tools[0] is always the "base" biowasm module)
-			aioli.fs.symlink(oldpath, newpath);
-		});
+	_ensureDir(path) {
+		if(aioli.fs.analyzePath(path).exists)
+			return;
+		aioli.fs.mkdirTree(path);
+	},
 
-		return mountedPaths.map(path => `${dirData}/${path}`);
+	_ensureLazyFile(dir, file) {
+		const path = `${dir}/${file.name}`;
+		if(aioli.fs.analyzePath(path).exists)
+			return;
+		aioli.fs.createLazyFile(dir, file.name, file.url, true, true);
+	},
+
+	_ensureSymlink(targetDir, name) {
+		const dirMounted = `${aioli.config.dirShared}${aioli.config.dirMounted}`;
+		const oldpath = `${dirMounted}/${name}`;
+		const newpath = `${targetDir}/${name}`;
+		aioli._ensureDir(targetDir);
+		try {
+			aioli.fs.unlink(newpath);
+		} catch(e) {}
+		aioli._log(`Creating symlink: ${newpath} --> ${oldpath}`);
+		aioli.fs.symlink(oldpath, newpath);
 	},
 
 	// =========================================================================
@@ -291,6 +328,8 @@ const aioli = {
 	},
 
 	write({ path, buffer, flag="w+", offset=0, position=0 }) {
+		if(typeof path === "string" && (path === aioli.config.dirInput || path.startsWith(`${aioli.config.dirInput}/`)))
+			throw `Cannot write to read-only mounted input path: ${path}`;
 		path = aioli._resolveFsPath(path);
 		const stream = aioli.fs.open(path, flag);
 		aioli.fs.write(stream, buffer, offset, buffer.length, position);
@@ -311,7 +350,7 @@ const aioli = {
 		await this.init();
 		// If reinitialized the base module, remount previously mounted files
 		if(tool.isBaseModule)
-			this.mount();
+			aioli._remountFiles();
 
 		// Go back to previous folder
 		this.cd(pwd);
@@ -401,21 +440,92 @@ const aioli = {
 		return true;
 	},
 
+	async opfsImportFromUrl(path, url) {
+		const response = await fetch(url);
+		if(!response.ok)
+			throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
+
+		if(aioli.config.opfsBackend === "direct" && aioli._supportsLegacyDirectOpfs()) {
+			const fsPath = aioli._resolveFsPath(`${aioli.config.dirOpfs}${path}`);
+			await aioli._directPrepareFile(fsPath, { create: true, truncate: true });
+			const entry = aioli._directEntryForFsPath(fsPath);
+			entry.accessHandle.truncate(0);
+
+			if(response.body?.getReader) {
+				const reader = response.body.getReader();
+				let offset = 0;
+				while(true) {
+					const { done, value } = await reader.read();
+					if(done)
+						break;
+					if(value?.byteLength > 0) {
+						entry.accessHandle.write(value, { at: offset });
+						offset += value.byteLength;
+					}
+				}
+				entry.size = offset;
+			} else {
+				const buffer = new Uint8Array(await response.arrayBuffer());
+				if(buffer.byteLength > 0)
+					entry.accessHandle.write(buffer, { at: 0 });
+				entry.size = buffer.byteLength;
+			}
+
+			entry.accessHandle.flush();
+			entry.timestamp = Date.now();
+			if(entry.node)
+				entry.node.timestamp = entry.timestamp;
+			return true;
+		}
+
+		const handle = await aioli._opfsLookup(path, { create: true });
+		const writable = await handle.createWritable();
+		try {
+			if(response.body?.getReader) {
+				const reader = response.body.getReader();
+				while(true) {
+					const { done, value } = await reader.read();
+					if(done)
+						break;
+					if(value?.byteLength > 0)
+						await writable.write(value);
+				}
+			} else {
+				await writable.write(await response.blob());
+			}
+		} finally {
+			await writable.close();
+		}
+		return true;
+	},
+
 	async opfsWrite(path, data = "") {
 		if(aioli.config.opfsBackend === "direct" && aioli._supportsLegacyDirectOpfs()) {
 			const fsPath = aioli._resolveFsPath(`${aioli.config.dirOpfs}${path}`);
 			await aioli._directPrepareFile(fsPath, { create: true, truncate: true });
 			const entry = aioli._directEntryForFsPath(fsPath);
-			const buffer = data instanceof Uint8Array
-				? data
-				: data instanceof ArrayBuffer
-					? new Uint8Array(data)
-					: new TextEncoder().encode(String(data));
 			entry.accessHandle.truncate(0);
-			if(buffer.byteLength > 0)
-				entry.accessHandle.write(buffer, { at: 0 });
+			if(data instanceof Blob) {
+				let offset = 0;
+				const chunkSize = 8 * 1024 * 1024;
+				while(offset < data.size) {
+					const chunk = new Uint8Array(await data.slice(offset, offset + chunkSize).arrayBuffer());
+					if(chunk.byteLength > 0)
+						entry.accessHandle.write(chunk, { at: offset });
+					offset += chunk.byteLength;
+				}
+				entry.size = data.size;
+			} else {
+				const buffer = data instanceof Uint8Array
+					? data
+					: data instanceof ArrayBuffer
+						? new Uint8Array(data)
+						: new TextEncoder().encode(String(data));
+				if(buffer.byteLength > 0)
+					entry.accessHandle.write(buffer, { at: 0 });
+				entry.size = buffer.byteLength;
+			}
 			entry.accessHandle.flush();
-			entry.size = buffer.byteLength;
 			entry.timestamp = Date.now();
 			if(entry.node)
 				entry.node.timestamp = entry.timestamp;
@@ -647,6 +757,7 @@ const aioli = {
 			FS.mkdir(aioli.config.dirShared, 0o777);
 			FS.mkdir(`${aioli.config.dirShared}/${aioli.config.dirData}`, 0o777);
 			FS.mkdir(`${aioli.config.dirShared}/${aioli.config.dirMounted}`, 0o777);
+			FS.mkdir(aioli.config.dirInput, 0o777);
 			await aioli._opfsBackendInitFS(FS, tool.module);
 			FS.chdir(`${aioli.config.dirShared}/${aioli.config.dirData}`);
 			aioli.fs = FS;

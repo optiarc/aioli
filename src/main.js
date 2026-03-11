@@ -17,6 +17,8 @@ const CONFIG_DEFAULTS = {
 	// so that operations like "samtools index" don't crash due to the read-only nature of WORKERS).
 	// Also mount URLs lazily in that folder.
 	dirData: "/data",
+	// Public read-only path for mounted user inputs.
+	dirInput: "/input",
 	// Public OPFS path presented to callers. The current implementation stages this
 	// under dirOpfsStage until direct OPFS mounts are available.
 	dirOpfs: "/opfs",
